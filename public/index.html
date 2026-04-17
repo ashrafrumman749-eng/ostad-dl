@@ -153,12 +153,13 @@
     line-height: 1.7;
     transition: border-color .2s;
   }
+
+  textarea:focus { border-color: var(--accent2); }
   #titles-input {
     white-space: pre;
     overflow-x: auto;
     word-break: keep-all;
   }
-  textarea:focus { border-color: var(--accent2); }
   textarea::placeholder { color: var(--dim); }
 
   .actions {
@@ -401,11 +402,6 @@ function connectSSE() {
   };
 }
 connectSSE();
-
-// ── Block Enter in titles (each line = one title, no accidental newlines) ──
-document.getElementById("titles-input").addEventListener("keydown", e => {
-  if (e.key === "Enter") e.preventDefault();
-});
 
 // ── Link counter ──────────────────────────────────────────────
 document.getElementById("links-input").addEventListener("input", () => {
