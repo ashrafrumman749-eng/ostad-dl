@@ -1,203 +1,207 @@
-import express from 'express';
-import { spawn } from 'child_process';
-import fs from 'fs';
-import path from 'path';
-import os from 'os';
-import fetch from 'node-fetch';
-import FormData from 'form-data';
+const express  = require("express");
+const { spawn } = require("child_process");
+const path      = require("path");
+const app       = express();
 
-const app = express();
 app.use(express.json());
-app.use(express.static('public'));
+app.use(express.static(path.join(__dirname, "public")));
 
-const REFERER = 'https://ostad.app';
-const BOT_TOKEN = process.env.BOT_TOKEN;
-const CHAT_ID = process.env.CHAT_ID;
-const WORK_DIR = path.join(os.homedir(), 'ostad_work');
-if (!fs.existsSync(WORK_DIR)) fs.mkdirSync(WORK_DIR, { recursive: true });
+// ── State ────────────────────────────────────────────────────────
+const jobQueue   = [];   // [{id, m3u8, title, status, logs[]}]
+let   current    = null;
+let   working    = false;
+let   sseClients = [];
+let   jobCounter = 0;
 
-// Job queue
-const queue = [];
-let processing = false;
-const jobs = {}; // id -> status
-
-function jobId() {
-  return Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
-}
-
-async function downloadM3u8(m3u8, outPath, onProgress) {
-  return new Promise((resolve, reject) => {
-    const args = [
-      '-y',
-      '-user_agent', 'Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36',
-      '-headers', `Accept: */*\r\nReferer: ${REFERER}\r\nOrigin: ${REFERER}\r\n`,
-      '-i', m3u8,
-      '-c', 'copy',
-      '-threads', '4',
-      '-movflags', '+faststart',
-      outPath,
-    ];
-    const ff = spawn('ffmpeg', args);
-    let duration = null;
-    ff.stderr.on('data', (d) => {
-      const line = d.toString();
-      const durMatch = line.match(/Duration:\s*(\d+):(\d+):(\d+)/);
-      if (durMatch && !duration) {
-        duration = parseInt(durMatch[1]) * 3600 + parseInt(durMatch[2]) * 60 + parseInt(durMatch[3]);
-      }
-      const timeMatch = line.match(/time=(\d+):(\d+):(\d+)/);
-      if (timeMatch && duration) {
-        const cur = parseInt(timeMatch[1]) * 3600 + parseInt(timeMatch[2]) * 60 + parseInt(timeMatch[3]);
-        const pct = Math.min(99, Math.floor(cur / duration * 100));
-        onProgress(pct);
-      }
-    });
-    ff.on('close', (code) => {
-      if (code === 0 && fs.existsSync(outPath) && fs.statSync(outPath).size > 1024) {
-        resolve();
-      } else {
-        reject(new Error('FFmpeg failed'));
-      }
-    });
+// ── SSE broadcast ────────────────────────────────────────────────
+function broadcast(event, data) {
+  const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+  sseClients = sseClients.filter(res => {
+    try { res.write(payload); return true; }
+    catch { return false; }
   });
 }
 
-async function uploadTelegram(filePath, title) {
-  const sizeMB = fs.statSync(filePath).size / 1048576;
-
-  if (sizeMB <= 49) {
-    // Bot API
-    const form = new FormData();
-    form.append('chat_id', CHAT_ID);
-    form.append('caption', `**${title}**`);
-    form.append('supports_streaming', 'true');
-    form.append('video', fs.createReadStream(filePath));
-    const res = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendVideo`, {
-      method: 'POST',
-      body: form,
-      timeout: 600000,
-    });
-    const data = await res.json();
-    if (!data.ok) throw new Error(data.description);
-    const msgId = data.result.message_id;
-    const chatUsername = CHAT_ID.startsWith('-100')
-      ? CHAT_ID.replace('-100', '')
-      : CHAT_ID;
-    return `https://t.me/c/${chatUsername}/${msgId}`;
-  } else {
-    // Large file — Bot API with sendVideo via multipart (up to 2GB via local bot api not available)
-    // Use tg-uploader workaround: compress to under 50MB or use python pyrogram
-    // For now use python script
-    return await uploadViaPython(filePath, title);
-  }
+// ── Helpers ──────────────────────────────────────────────────────
+function fmtTime(sec) {
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  const s = sec % 60;
+  if (h) return `${h}h ${m}m ${s}s`;
+  if (m) return `${m}m ${s}s`;
+  return `${s}s`;
 }
 
-async function uploadViaPython(filePath, title) {
-  return new Promise((resolve, reject) => {
-    const script = `
-import asyncio, os, sys
-from pyrogram import Client
+function getQueueState() {
+  return {
+    jobs: jobQueue.map(j => ({
+      id:      j.id,
+      title:   j.title || `Video_${j.id}`,
+      m3u8:    j.m3u8.slice(0, 60) + (j.m3u8.length > 60 ? "…" : ""),
+      status:  j.status,
+      started: j.started || null,
+      ended:   j.ended   || null,
+    })),
+    current: current ? current.id : null,
+    pending: jobQueue.filter(j => j.status === "pending").length,
+    done:    jobQueue.filter(j => j.status === "done").length,
+    failed:  jobQueue.filter(j => j.status === "failed").length,
+  };
+}
 
-async def main():
-    async with Client(
-        "ostad_bot",
-        api_id=int(os.environ["API_ID"]),
-        api_hash=os.environ["API_HASH"],
-        bot_token=os.environ["BOT_TOKEN"],
-        in_memory=True,
-    ) as app:
-        msg = await app.send_video(
-            chat_id="@torkisomossa",
-            video=sys.argv[1],
-            caption=f"**{sys.argv[2]}**",
-            supports_streaming=True,
-        )
-        print(msg.link)
+// ── Queue processor ──────────────────────────────────────────────
+function processNext() {
+  if (working || jobQueue.length === 0) return;
+  const job = jobQueue.find(j => j.status === "pending");
+  if (!job) return;
 
-asyncio.run(main())
-`;
-    const tmpScript = path.join(WORK_DIR, 'upload_tmp.py');
-    fs.writeFileSync(tmpScript, script);
-    const proc = spawn('python3', [tmpScript, filePath, title], {
-      env: {
-        ...process.env,
-        API_ID: process.env.API_ID,
-        API_HASH: process.env.API_HASH,
-        BOT_TOKEN: process.env.BOT_TOKEN,
-      },
+  working     = true;
+  current     = job;
+  job.status  = "running";
+  job.started = Date.now();
+
+  broadcast("queue", getQueueState());
+  broadcast("log",   { id: job.id, line: `[SERVER] ▶ Starting: ${job.title || `Video_${job.id}`}` });
+
+  const input = JSON.stringify({
+    m3u8:    job.m3u8,
+    title:   job.title,
+    referer: "https://ostad.app",
+  });
+
+  const proc = spawn("python3", [path.join(__dirname, "worker.py")], {
+    env: { ...process.env },
+    cwd: __dirname,
+  });
+
+  proc.stdin.write(input);
+  proc.stdin.end();
+
+  const handleLines = (prefix) => (chunk) => {
+    chunk.toString().split("\n").forEach(line => {
+      line = line.trim();
+      if (!line) return;
+      const tagged = prefix ? `[PY-ERR] ${line}` : line;
+      job.logs.push(tagged);
+      broadcast("log", { id: job.id, line: tagged });
     });
-    let out = '';
-    proc.stdout.on('data', (d) => (out += d.toString()));
-    proc.on('close', (code) => {
-      if (code === 0 && out.trim()) resolve(out.trim());
-      else reject(new Error('Python upload failed'));
-    });
+  };
+
+  proc.stdout.on("data", handleLines(false));
+  proc.stderr.on("data", handleLines(true));
+
+  proc.on("close", code => {
+    job.ended  = Date.now();
+    job.status = code === 0 ? "done" : "failed";
+    job.code   = code;
+
+    const elapsed = Math.round((job.ended - job.started) / 1000);
+    const summary = code === 0
+      ? `[SERVER] ✓ Done in ${fmtTime(elapsed)}`
+      : `[SERVER] ✗ Failed (exit ${code}) after ${fmtTime(elapsed)}`;
+
+    job.logs.push(summary);
+    broadcast("log",   { id: job.id, line: summary });
+    broadcast("queue", getQueueState());
+
+    current = null;
+    working = false;
+    processNext();
   });
 }
 
-async function processQueue() {
-  if (processing || queue.length === 0) return;
-  processing = true;
+// ── Routes ───────────────────────────────────────────────────────
 
-  const job = queue.shift();
-  jobs[job.id] = { ...job, status: 'downloading', progress: 0 };
+// SSE stream
+app.get("/events", (req, res) => {
+  res.setHeader("Content-Type",  "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection",    "keep-alive");
+  res.flushHeaders();
 
-  const jobDir = path.join(WORK_DIR, job.id);
-  fs.mkdirSync(jobDir, { recursive: true });
-  const outPath = path.join(jobDir, 'video.mp4');
+  // Send current state on connect
+  res.write(`event: queue\ndata: ${JSON.stringify(getQueueState())}\n\n`);
 
-  try {
-    // Download
-    await downloadM3u8(job.m3u8, outPath, (pct) => {
-      jobs[job.id].progress = pct;
-      jobs[job.id].status = 'downloading';
+  // Replay running job logs so page refresh doesn't lose history
+  if (current) {
+    current.logs.forEach(line => {
+      res.write(`event: log\ndata: ${JSON.stringify({ id: current.id, line })}\n\n`);
     });
-
-    const sizeMB = Math.round(fs.statSync(outPath).size / 1048576 * 10) / 10;
-    jobs[job.id].status = 'uploading';
-    jobs[job.id].sizeMB = sizeMB;
-
-    // Upload
-    const link = await uploadTelegram(outPath, job.title);
-    jobs[job.id].status = 'done';
-    jobs[job.id].link = link;
-
-  } catch (e) {
-    jobs[job.id].status = 'error';
-    jobs[job.id].error = e.message;
-  } finally {
-    fs.rmSync(jobDir, { recursive: true, force: true });
-    processing = false;
-    processQueue();
   }
-}
 
-// Routes
-app.post('/add', (req, res) => {
-  const { items } = req.body;
-  if (!items || !Array.isArray(items) || items.length === 0) {
-    return res.json({ ok: false, error: 'No items' });
-  }
+  sseClients.push(res);
+
+  const ping = setInterval(() => {
+    try { res.write(": ping\n\n"); } catch {}
+  }, 20000);
+
+  req.on("close", () => {
+    clearInterval(ping);
+    sseClients = sseClients.filter(r => r !== res);
+  });
+});
+
+// Add bulk jobs
+// POST { links: ["url1",...], titles: ["t1",...] }
+app.post("/add", (req, res) => {
+  const { links, titles } = req.body;
+
+  if (!Array.isArray(links) || links.length === 0)
+    return res.json({ ok: false, error: "links array required" });
+
   const added = [];
-  for (const item of items) {
-    const m3u8 = (item.m3u8 || '').trim();
-    const title = (item.title || '').trim() || `Video_${Date.now()}`;
-    if (!m3u8 || !m3u8.includes('.m3u8')) continue;
-    const id = jobId();
-    queue.push({ id, m3u8, title });
-    jobs[id] = { id, m3u8, title, status: 'queued', progress: 0 };
-    added.push({ id, title });
+  links.forEach((rawLink, i) => {
+    const m3u8 = (rawLink || "").trim();
+    if (!m3u8 || !m3u8.includes(".m3u8")) return;
+
+    jobCounter++;
+    const title = Array.isArray(titles) && titles[i] ? titles[i].trim() : "";
+    const job = {
+      id: jobCounter, m3u8, title,
+      status: "pending", logs: [],
+      started: null, ended: null,
+    };
+    jobQueue.push(job);
+    added.push({ id: job.id, title: title || `Video_${job.id}` });
+  });
+
+  broadcast("queue", getQueueState());
+  res.json({ ok: true, added, queued: jobQueue.filter(j => j.status === "pending").length });
+  processNext();
+});
+
+// Full logs for one job
+app.get("/logs/:id", (req, res) => {
+  const job = jobQueue.find(j => j.id === parseInt(req.params.id));
+  if (!job) return res.json({ ok: false, error: "not found" });
+  res.json({ ok: true, id: job.id, status: job.status, logs: job.logs });
+});
+
+// Queue state
+app.get("/queue", (req, res) => res.json(getQueueState()));
+
+// Clear finished jobs
+app.post("/clear", (req, res) => {
+  let removed = 0;
+  for (let i = jobQueue.length - 1; i >= 0; i--) {
+    if (jobQueue[i].status === "done" || jobQueue[i].status === "failed") {
+      jobQueue.splice(i, 1);
+      removed++;
+    }
   }
-  processQueue();
-  res.json({ ok: true, added, queued: queue.length });
+  broadcast("queue", getQueueState());
+  res.json({ ok: true, removed });
 });
 
-app.get('/status', (req, res) => {
-  const list = Object.values(jobs).slice(-100);
-  res.json({ ok: true, queue: queue.length, jobs: list });
-});
+// Health
+app.get("/health", (req, res) => res.json({ ok: true, ...getQueueState() }));
 
-app.get('/health', (req, res) => res.json({ ok: true }));
-
+// ── Boot ─────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Ostad DL running on port ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`[SERVER] Ostad→TG on port ${PORT}`);
+  console.log(`[SERVER] BOT_TOKEN  : ${process.env.BOT_TOKEN  ? "✓" : "✗ MISSING"}`);
+  console.log(`[SERVER] CHAT_ID    : ${process.env.CHAT_ID    ? "✓" : "✗ MISSING"}`);
+  console.log(`[SERVER] TG_API_ID  : ${process.env.TG_API_ID  ? "✓" : "✗ MISSING"}`);
+  console.log(`[SERVER] TG_API_HASH: ${process.env.TG_API_HASH ? "✓" : "✗ MISSING"}`);
+});
