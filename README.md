@@ -1,26 +1,47 @@
-# Ostad DL → Telegram
+# Ostad → Telegram Bulk Downloader
 
-m3u8 bulk downloader → Telegram channel uploader
+m3u8 links bulk করে paste করো → Railway server auto download করে TG channel এ পাঠাবে।
 
-## Railway Environment Variables
+## File Structure
 
 ```
-BOT_TOKEN=your_bot_token
-CHAT_ID=-1003960861009
-API_ID=your_api_id
-API_HASH=your_api_hash
+ostad-tg/
+├── server.js          ← Node.js Express (queue + SSE + frontend serve)
+├── worker.py          ← Python (ffmpeg download + Telegram upload)
+├── public/
+│   └── index.html     ← Frontend UI
+├── package.json
+├── requirements.txt
+└── nixpacks.toml      ← Railway build config
 ```
 
-## Deploy
+## Railway Deploy
 
-1. GitHub এ push কর
-2. Railway তে New Project → GitHub repo select কর
-3. Environment variables add কর
-4. Deploy!
+1. GitHub এ repo বানাও, এই files push করো
+2. Railway → New Project → Deploy from GitHub
+3. Environment Variables set করো:
+
+```
+BOT_TOKEN    = your_bot_token
+CHAT_ID      = -1001234567890   (channel ID, negative number)
+TG_API_ID    = 12345678
+TG_API_HASH  = abcdef1234567890abcdef
+```
+
+> **Bot কে channel এ admin করো** (send messages permission লাগবে)
+
+## How It Works
+
+- **Small files (≤49MB)** → Bot API দিয়ে upload
+- **Large files (>49MB, ~1GB)** → Pyrogram (MTProto) দিয়ে upload
+- **Referer** সব request এ automatically `https://ostad.app` যাবে
+- **Real-time logs** → SSE দিয়ে browser এ live দেখা যাবে
+- **Bulk input** → 40-50 links একসাথে paste করো, titles optional
 
 ## Usage
 
-- Frontend এ m3u8 link + title দে
-- ＋ বাটন দিয়ে আরো add কর
-- Submit করলে queue হয়ে একটা একটা করে download → upload হবে
-- নিচে realtime status দেখা যাবে
+1. Railway URL open করো
+2. Left box → m3u8 links (one per line)
+3. Right box → titles (optional, same line number = same link)
+4. "Add to Queue" click করো
+5. Log panel এ real-time progress দেখো
